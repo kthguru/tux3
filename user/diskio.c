@@ -7,6 +7,29 @@
 #include "trace.h"
 #include "diskio.h"
 
+int iovabs(int fd, struct iovec *iov, int iovcnt, int out, off_t offset)
+{
+	while (1) {
+		ssize_t ret;
+
+		if (out)
+			ret = pwritev(fd, iov, iovcnt, offset);
+		else
+			ret = preadv(fd, iov, iovcnt, offset);
+		if (ret == -1) {
+			if (errno == EAGAIN || errno == EINTR)
+				continue;
+			return -errno;
+		}
+		if (ret == 0)
+			return -EIO;
+
+		break;
+	}
+
+	return 0;
+}
+
 int ioabs(int fd, void *data, size_t count, int out, off_t offset)
 {
 	while (count) {
