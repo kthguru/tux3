@@ -707,8 +707,8 @@ struct buffer_head *peekblk(struct address_space *mapping, block_t iblock)
 	pgoff_t index;
 	int offset;
 
-	/* Untested */
-	WARN_ON(1);
+	/* Untested: slightly test though, need to review deeply */
+//	WARN_ON(1);
 
 	index = iblock >> (PAGE_CACHE_SHIFT - inode->i_blkbits);
 	offset = iblock & ((1 << (PAGE_CACHE_SHIFT - inode->i_blkbits)) - 1);
