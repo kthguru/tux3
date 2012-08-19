@@ -810,7 +810,9 @@ struct buffer_head *blockget(struct address_space *mapping, block_t iblock)
 
 static int tux3_readpage(struct file *file, struct page *page)
 {
-	return mpage_readpage(page, tux3_get_block);
+	int err = mpage_readpage(page, tux3_get_block);
+	assert(!PageForked(page));	/* FIXME: handle forked page */
+	return err;
 }
 
 static int tux3_readpages(struct file *file, struct address_space *mapping,
@@ -829,6 +831,7 @@ static int tux3_da_write_begin(struct file *file, struct address_space *mapping,
 
 	ret = tux3_write_begin(mapping, pos, len, flags, pagep,
 				tux3_da_get_block);
+	assert(!PageForked(*pagep));	/* FIXME: handle forked page */
 	if (ret < 0)
 		tux3_write_failed(mapping, pos + len);
 	return ret;
@@ -985,7 +988,9 @@ const struct address_space_operations tux_aops = {
 
 static int tux3_blk_readpage(struct file *file, struct page *page)
 {
-	return block_read_full_page(page, tux3_get_block);
+	int err = block_read_full_page(page, tux3_get_block);
+	assert(!PageForked(page));	/* FIXME: handle forked page */
+	return err;
 }
 
 #if 0 /* disabled writeback for now */
