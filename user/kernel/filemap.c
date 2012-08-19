@@ -902,6 +902,42 @@ static ssize_t tux3_direct_IO(int rw, struct kiocb *iocb,
 	return ret;
 }
 
+/* Based on block_invalidatepage() */
+static void tux3_invalidatepage(struct page *page, unsigned long offset)
+{
+	struct buffer_head *head, *bh, *next;
+	unsigned int curr_off = 0;
+
+	BUG_ON(!PageLocked(page));
+	if (!page_has_buffers(page))
+		goto out;
+
+	head = page_buffers(page);
+	bh = head;
+	do {
+		unsigned int next_off = curr_off + bh->b_size;
+		next = bh->b_this_page;
+
+		/*
+		 * is this block fully invalidated?
+		 */
+		if (offset <= curr_off)
+			tux3_invalidate_buffer(bh);
+		curr_off = next_off;
+		bh = next;
+	} while (bh != head);
+
+	/*
+	 * We release buffers only if the entire page is being invalidated.
+	 * The get_block cached value has been unconditionally invalidated,
+	 * so real IO is not possible anymore.
+	 */
+	if (offset == 0)
+		try_to_release_page(page, 0);
+out:
+	return;
+}
+
 static sector_t tux3_bmap(struct address_space *mapping, sector_t iblock)
 {
 	sector_t blocknr;
@@ -923,7 +959,7 @@ const struct address_space_operations tux_aops = {
 	.write_begin		= tux3_da_write_begin,
 	.write_end		= tux3_da_write_end,
 	.bmap			= tux3_bmap,
-//	.invalidatepage		= ext4_da_invalidatepage,
+	.invalidatepage		= tux3_invalidatepage,
 //	.releasepage		= ext4_releasepage,
 	.direct_IO		= tux3_direct_IO,
 	.migratepage		= buffer_migrate_page,
@@ -950,6 +986,7 @@ const struct address_space_operations tux_blk_aops = {
 	.writepages	= tux3_disable_writepages,
 	.write_begin	= tux3_da_write_begin,
 	.bmap		= tux3_bmap,
+	.invalidatepage	= tux3_invalidatepage,
 };
 
 static int tux3_vol_get_block(struct inode *inode, sector_t iblock,
@@ -990,5 +1027,6 @@ const struct address_space_operations tux_vol_aops = {
 	.writepage	= tux3_disable_writepage,
 	.writepages	= tux3_disable_writepages,
 	.write_begin	= tux3_vol_write_begin,
+	.invalidatepage	= tux3_invalidatepage,
 };
 #endif /* __KERNEL__ */
