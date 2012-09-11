@@ -252,6 +252,8 @@ struct sb {
 	spinlock_t forked_buffers_lock;
 	struct link forked_buffers;	/* forked buffers list */
 #ifdef __KERNEL__
+	struct backing_dev_info bdi;
+	struct backing_dev_info *orig_bdi;
 	struct super_block *vfs_sb; /* Generic kernel superblock */
 #else
 	struct dev *dev;		/* userspace block device */

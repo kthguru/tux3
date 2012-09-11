@@ -806,6 +806,8 @@ static void tux_setup_inode(struct inode *inode)
 //	inode->i_generation = 0;
 //	inode->i_flags = 0;
 
+//	inode->i_data.backing_dev_info = inode->i_sb->s_bdi;
+
 	switch (inode->i_mode & S_IFMT) {
 	case S_IFSOCK:
 	case S_IFIFO:

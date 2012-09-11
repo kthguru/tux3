@@ -8,6 +8,8 @@
 #ifdef __KERNEL__
 #include <linux/module.h>
 #include <linux/statfs.h>
+#include <linux/kthread.h>
+#include <linux/freezer.h>
 
 /* This will go to include/linux/magic.h */
 #ifndef TUX3_SUPER_MAGIC
@@ -297,6 +299,224 @@ static int tux3_sync_fs(struct super_block *sb, int wait)
 	return force_delta(tux_sb(sb));
 }
 
+struct wb_writeback_work {
+	long nr_pages;
+	struct super_block *sb;
+	unsigned long *older_than_this;
+	enum writeback_sync_modes sync_mode;
+	unsigned int tagged_writepages:1;
+	unsigned int for_kupdate:1;
+	unsigned int range_cyclic:1;
+	unsigned int for_background:1;
+	enum wb_reason reason;		/* why was writeback initiated? */
+
+	struct list_head list;		/* pending work list */
+	struct completion *done;	/* set if the caller waits */
+};
+
+static struct wb_writeback_work *
+get_next_work_item(struct backing_dev_info *bdi)
+{
+	struct wb_writeback_work *work = NULL;
+
+	spin_lock_bh(&bdi->wb_lock);
+	if (!list_empty(&bdi->work_list)) {
+		work = list_entry(bdi->work_list.next,
+				  struct wb_writeback_work, list);
+		list_del_init(&work->list);
+	}
+	spin_unlock_bh(&bdi->wb_lock);
+	return work;
+}
+
+static long tux3_do_writeback(struct bdi_writeback *wb, int force_wait)
+{
+	struct backing_dev_info *bdi = wb->bdi;
+	struct wb_writeback_work *work = NULL;
+	long wrote = 0;
+
+	set_bit(BDI_writeback_running, &wb->bdi->state);
+	while ((work = get_next_work_item(bdi)) != NULL) {
+		/*
+		 * Override sync mode, in case we must wait for completion
+		 * because this thread is exiting now.
+		 */
+		if (force_wait)
+			work->sync_mode = WB_SYNC_ALL;
+#if 0
+		wrote += wb_writeback(wb, work);
+#endif
+		/*
+		 * Notify the caller of completion if this is a synchronous
+		 * work item, otherwise just free it.
+		 */
+		if (work->done)
+			complete(work->done);
+		else
+			kfree(work);
+	}
+#if 0
+	/*
+	 * Check for periodic writeback, kupdated() style
+	 */
+	wrote += wb_check_old_data_flush(wb);
+	wrote += wb_check_background_flush(wb);
+#endif
+	clear_bit(BDI_writeback_running, &wb->bdi->state);
+
+	return wrote;
+}
+
+/*
+ * Handle writeback of dirty data for the device backed by this bdi. Also
+ * wakes up periodically and does kupdated style flushing.
+ */
+int tux3_writeback_thread(void *data)
+{
+	struct bdi_writeback *wb = data;
+	struct backing_dev_info *bdi = wb->bdi;
+	long pages_written;
+
+	current->flags |= PF_SWAPWRITE;
+	set_freezable();
+	wb->last_active = jiffies;
+
+	/*
+	 * Our parent may run at a different priority, just set us to normal
+	 */
+	set_user_nice(current, 0);
+
+	while (!kthread_freezable_should_stop(NULL)) {
+		/*
+		 * Remove own delayed wake-up timer, since we are already awake
+		 * and we'll take care of the preriodic write-back.
+		 */
+		del_timer(&wb->wakeup_timer);
+
+		pages_written = tux3_do_writeback(wb, 0);
+
+		if (pages_written)
+			wb->last_active = jiffies;
+
+		set_current_state(TASK_INTERRUPTIBLE);
+		if (!list_empty(&bdi->work_list) || kthread_should_stop()) {
+			__set_current_state(TASK_RUNNING);
+			continue;
+		}
+
+		if (wb_has_dirty_io(wb) && dirty_writeback_interval)
+			schedule_timeout(msecs_to_jiffies(dirty_writeback_interval * 10));
+		else {
+			/*
+			 * We have nothing to do, so can go sleep without any
+			 * timeout and save power. When a work is queued or
+			 * something is made dirty - we will be woken up.
+			 */
+			schedule();
+		}
+	}
+
+	/* Flush any work that raced with us exiting */
+	if (!list_empty(&bdi->work_list))
+		tux3_do_writeback(wb, 1);
+
+	return 0;
+}
+
+#ifndef BDI_SET_TO_MAPPING
+static int passthrough_congested_fn(void *data, int bits)
+{
+	struct sb *sbi = data;
+	return bdi_congested(sbi->orig_bdi, bits);
+}
+#else
+static int bug_congested_fn(void *data, int bits)
+{
+	BUG();
+	return 0;
+}
+#endif
+
+/*
+ * We need to disable writeback to control dirty flags of inode.
+ * Otherwise, writeback will clear dirty, and inode can be reclaimed
+ * without our control.
+ */
+static int setup_bdi(struct super_block *sb)
+{
+	struct sb *sbi = tux_sb(sb);
+	struct backing_dev_info *bdi = &sbi->bdi;
+	struct backing_dev_info *orig_bdi = sb->s_bdi;
+	dev_t dev = sb->s_bdev->bd_dev;
+	struct task_struct *task;
+	int err;
+
+	bdi->name		= "tux3";
+#ifndef BDI_SET_TO_MAPPING
+	bdi->capabilities	= orig_bdi->capabilities | BDI_CAP_NO_WRITEBACK;
+	bdi->ra_pages		= orig_bdi->ra_pages;
+	bdi->congested_fn	= passthrough_congested_fn;
+	bdi->congested_data	= sbi;
+#else
+	bdi->capabilities	= BDI_CAP_NO_WRITEBACK;
+	bdi->congested_fn	= bug_congested_fn;
+#endif
+
+	err = bdi_init(bdi);
+	if (err)
+		return err;
+
+	err = bdi_register(bdi, NULL, "%s-%u:%u", bdi->name,
+			   MAJOR(dev), MINOR(dev));
+	if (err) {
+		bdi_destroy(bdi);
+		return err;
+	}
+
+	sbi->orig_bdi = orig_bdi;
+	sb->s_bdi = bdi;
+
+	task = kthread_create(tux3_writeback_thread, &bdi->wb,
+			      "flush-%s", dev_name(bdi->dev));
+	if (IS_ERR(task)) {
+		bdi_destroy(bdi);
+		return PTR_ERR(task);
+	}
+
+	/*
+	 * The spinlock makes sure we do not lose wake-ups when racing
+	 * with 'bdi_queue_work()'.  And as soon as the bdi thread is
+	 * visible, we can start it.
+	 */
+	spin_lock_bh(&bdi->wb_lock);
+	bdi->wb.task = task;
+	spin_unlock_bh(&bdi->wb_lock);
+
+	return 0;
+}
+
+static void cleanup_bdi(struct super_block *sb)
+{
+	struct backing_dev_info *bdi = sb->s_bdi;
+	struct task_struct *task;
+
+	sb->s_bdi = tux_sb(sb)->orig_bdi;
+
+	/*
+	 * Finally, kill the kernel thread. We don't need to be RCU
+	 * safe anymore, since the bdi is gone from visibility.
+	 */
+	spin_lock_bh(&bdi->wb_lock);
+	task = bdi->wb.task;
+	bdi->wb.task = NULL;
+	spin_unlock_bh(&bdi->wb_lock);
+
+	if (task)
+		kthread_stop(task);
+
+	bdi_destroy(bdi);
+}
+
 static void tux3_put_super(struct super_block *sb)
 {
 	struct sb *sbi = tux_sb(sb);
@@ -304,6 +524,8 @@ static void tux3_put_super(struct super_block *sb)
 	cleanup_dirty_for_umount(sbi);
 
 	__tux3_put_super(sbi);
+	cleanup_bdi(sb);
+
 	sb->s_fs_info = NULL;
 	kfree(sbi);
 }
@@ -361,12 +583,18 @@ static int tux3_fill_super(struct super_block *sb, void *data, int silent)
 	sb->s_op = &tux3_super_ops;
 	sb->s_time_gran = 1;
 
+	err = setup_bdi(sb);
+	if (err) {
+		printk(KERN_ERR "TUX3: unable to setup bdi\n");
+		goto error_free;
+	}
+
 	err = -EIO;
 	blocksize = sb_min_blocksize(sb, BLOCK_SIZE);
 	if (!blocksize) {
 		if (!silent)
 			printk(KERN_ERR "TUX3: unable to set blocksize\n");
-		goto error_free;
+		goto error_bdi;
 	}
 
 	/* Initialize and load sbi */
@@ -414,6 +642,8 @@ error:
 	if (!IS_ERR_OR_NULL(rp))
 		replay_stage3(rp, 0);
 	__tux3_put_super(sbi);
+error_bdi:
+	cleanup_bdi(sb);
 error_free:
 	kfree(sbi);
 
